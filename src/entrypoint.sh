@@ -1,96 +1,77 @@
 #!/bin/bash
 
-# ================= 配置区域 =================
-# 1. 核心路径配置 (伪装成通用数据引擎)
-STORAGE_ROOT="/var/lib/data_engine"  # 数据库位置
-CACHE_ROOT="/var/lib/engine_cache"   # 缓存位置
-# 如果用户设置了 MUSIC_DIR，则使用用户的，否则使用默认
-MUSIC_ROOT=${MUSIC_DIR:-/var/lib/media_store}
+# ================= 变量处理区域 =================
+# 1. 基础变量 (用户指定)
+MUSIC_ROOT=${MUSIC_DIR:-/music}                   # 音乐目录
+SYNC_SOURCES=${DATASET_MUSIC_NAME}                # 数据集 (支持逗号分隔)
+AUTH_TOKEN=${MUSIC_TOKEN}                         # Token
+BACKUP_REPO=${BACKUP_DATASET_ID}                  # 备份数据集
+BACKUP_CYCLE=${BACKUP_INTERVAL:-3600}             # 备份间隔
+SYNC_CYCLE=${MUSIC_UPDATE_INTERVAL:-3600}         # 同步间隔
 
-# 2. 同步与备份配置
-SYNC_SOURCES=${DATASET_MUSIC_NAME}   # 格式：user/repo1,user/repo2
-AUTH_TOKEN=${MUSIC_TOKEN}            # HF Token
-BACKUP_REPO=${BACKUP_DATASET_ID}     # 备份用 Dataset
-SYNC_INTERVAL=${MUSIC_UPDATE_INTERVAL:-3600}
-BACKUP_INTERVAL=${BACKUP_INTERVAL:-3600}
+# 2. 内部固定配置 (用户无需关心)
+INTERNAL_DATA="/var/lib/data_engine"              # 数据库存放位置
+INTERNAL_CACHE="/var/lib/engine_cache"            # 缓存位置
+FAKE_PROCESS_NAME="system_daemon"                 # 伪装进程名
 
-# 3. 进程伪装名称
-FAKE_PROCESS_NAME="system_daemon"
-# ===========================================
-
-echo "[BOOT] System Initializing..."
-echo "[BOOT] Loading configuration..."
-
-# --- 核心：环境变量透传区域 ---
-# 将用户在 HF 设置的变量明确导出，确保内核能读取
-# 虽然 Docker 默认会透传，但显式声明更安全，方便调试
-
-# 基础设置
-export ND_DATAFOLDER="${STORAGE_ROOT}"
+# 3. 导出 Navidrome 所需的环境变量
+# 将用户填写的 ND_ 变量直接导出给进程
 export ND_MUSICFOLDER="${MUSIC_ROOT}"
-export ND_CACHEFOLDER="${CACHE_ROOT}"
-export ND_PORT=${ND_PORT:-7860}  # HF 强制端口
-export ND_BASEURL=${ND_BASEURL:-""} # 反代地址
+export ND_DATAFOLDER="${INTERNAL_DATA}"
+export ND_CACHEFOLDER="${INTERNAL_CACHE}"
+export ND_PORT=7860                               # HF 强制端口
 
-# 第三方集成 (Last.fm / Spotify)
+# 导出额外的功能变量 (Last.fm, Spotify, Sharing)
 export ND_LASTFM_APIKEY=${ND_LASTFM_APIKEY:-""}
 export ND_LASTFM_SECRET=${ND_LASTFM_SECRET:-""}
 export ND_SPOTIFY_ID=${ND_SPOTIFY_ID:-""}
 export ND_SPOTIFY_SECRET=${ND_SPOTIFY_SECRET:-""}
+export ND_ENABLESHARING=${ND_ENABLESHARING:-false}
 
-# 功能开关
-export ND_ENABLESHARING=${ND_ENABLESHARING:-false} # 是否开启分享
-export ND_SCANSCHEDULE=${ND_SCANSCHEDULE:-"@every 1h"} # 扫描频率
-export ND_LOGLEVEL=${ND_LOGLEVEL:-"info"} 
+# ================= 逻辑执行区域 =================
 
-# -----------------------------------
+echo "[BOOT] Initializing System..."
 
-# 1. 目录准备
-mkdir -p ${STORAGE_ROOT} ${CACHE_ROOT} ${MUSIC_ROOT} /.cache
-chmod -R 777 ${STORAGE_ROOT} ${CACHE_ROOT} ${MUSIC_ROOT} /.cache
+# 1. 创建目录
+mkdir -p "${INTERNAL_DATA}" "${INTERNAL_CACHE}" "${MUSIC_ROOT}" /.cache
+chmod -R 777 "${INTERNAL_DATA}" "${INTERNAL_CACHE}" "${MUSIC_ROOT}" /.cache
 
-# 2. 激活虚拟环境
+# 2. 激活 Python 环境
 source /venv/bin/activate
 
-# 3. 恢复状态 (Archive Restore)
+# 3. 恢复备份 (如果有配置)
 if [ -n "$BACKUP_REPO" ] && [ -n "$AUTH_TOKEN" ]; then
-    echo "[BOOT] Checking integrity (Restore)..."
-    python3 /app/state_manager.py download "$AUTH_TOKEN" "$BACKUP_REPO" "${STORAGE_ROOT}"
+    echo "[BOOT] Restoring state..."
+    python3 /app/state_manager.py download "$AUTH_TOKEN" "$BACKUP_REPO" "${INTERNAL_DATA}"
 fi
 
-# 4. 启动多源同步 (Resource Sync) - 后台运行
+# 4. 启动多数据集同步 (后台运行)
 if [ -n "$SYNC_SOURCES" ] && [ -n "$AUTH_TOKEN" ]; then
-    echo "[BOOT] Starting I/O processor (Sync)..."
-    # 传入: 数据集列表, token, 音乐目录, 间隔, 是否强制
-    python3 /app/core_processor.py "$SYNC_SOURCES" "$AUTH_TOKEN" "${MUSIC_ROOT}" "$SYNC_INTERVAL" "false" &
+    echo "[BOOT] Starting sync daemon..."
+    # 传入: 数据集列表, token, 音乐目录, 间隔
+    python3 /app/core_processor.py "$SYNC_SOURCES" "$AUTH_TOKEN" "${MUSIC_ROOT}" "$SYNC_CYCLE" "false" &
 fi
 
-# 5. 启动自动备份 (State Backup) - 后台运行
+# 5. 启动自动备份 (后台运行)
 if [ -n "$BACKUP_REPO" ] && [ -n "$AUTH_TOKEN" ]; then
-    echo "[BOOT] Initializing backup scheduler..."
     (
         while true; do
-            sleep "${BACKUP_INTERVAL}"
-            python3 /app/state_manager.py upload "$AUTH_TOKEN" "$BACKUP_REPO" "${STORAGE_ROOT}"
+            sleep "${BACKUP_CYCLE}"
+            python3 /app/state_manager.py upload "$AUTH_TOKEN" "$BACKUP_REPO" "${INTERNAL_DATA}"
         done
     ) &
 fi
 
-# 6. 核心：进程伪装与启动
+# 6. 伪装并启动主进程
 ORIG_BIN=$(which navidrome || find /app -name navidrome -type f | head -1)
 
 if [ -f "$ORIG_BIN" ]; then
-    # 复制并重命名二进制文件
     TARGET_BIN="/app/${FAKE_PROCESS_NAME}"
     cp "$ORIG_BIN" "$TARGET_BIN"
     chmod +x "$TARGET_BIN"
-    
-    echo "[BOOT] Launching daemon [PID $$]..."
-    
-    # 启动伪装后的进程
-    # exec 会替换当前 shell 进程，让 system_daemon 成为 PID 1 (或主进程)
+    echo "[BOOT] System ready."
     exec "$TARGET_BIN"
 else
-    echo "[FATAL] Engine binary missing."
+    echo "[FATAL] Binary not found."
     exit 1
 fi
