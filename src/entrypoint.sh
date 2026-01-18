@@ -14,7 +14,7 @@ INTERNAL_DATA="/var/lib/data_engine"
 INTERNAL_CACHE="/var/lib/engine_cache"
 FAKE_PROCESS_NAME="system_daemon"
 
-# 3. 导出环境变量
+# 3. 导出环境变量给 Navidrome
 export ND_MUSICFOLDER="${MUSIC_ROOT}"
 export ND_DATAFOLDER="${INTERNAL_DATA}"
 export ND_CACHEFOLDER="${INTERNAL_CACHE}"
@@ -37,7 +37,7 @@ source /venv/bin/activate
 # 2. 恢复备份
 if [ -n "$BACKUP_REPO" ] && [ -n "$AUTH_TOKEN" ]; then
     echo "[BOOT] Restoring state..."
-    # 忽略可能的初次运行错误
+    # 加上 || true 防止没有备份时报错退出
     python3 /app/state_manager.py download "$AUTH_TOKEN" "$BACKUP_REPO" "${INTERNAL_DATA}" || true
 fi
 
@@ -58,7 +58,7 @@ if [ -n "$BACKUP_REPO" ] && [ -n "$AUTH_TOKEN" ]; then
 fi
 
 # 5. 启动伪装的主进程
-# 二进制文件已经在 Dockerfile 阶段准备好了
+# 注意：这里直接运行 Dockerfile 里准备好的文件
 TARGET_BIN="/app/${FAKE_PROCESS_NAME}"
 
 if [ -f "$TARGET_BIN" ]; then
@@ -66,7 +66,7 @@ if [ -f "$TARGET_BIN" ]; then
     exec "$TARGET_BIN"
 else
     echo "[FATAL] Binary not found at $TARGET_BIN"
-    # 回退方案：尝试找原始文件 (防灾)
+    # 如果伪装失败，尝试运行原始文件（保底）
     if [ -f "/app/navidrome" ]; then
         echo "[WARN] Fallback to original binary"
         exec /app/navidrome
