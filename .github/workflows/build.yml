@@ -1,8 +1,9 @@
-name: Build and Push
+name: Build and Push (Auto Versioning)
 
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
   packages: write
@@ -13,16 +14,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
+      # 1. 登录到 GitHub Packages
       - uses: docker/login-action@v2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      
+
+      # 2. 生成元数据 (自动把用户名转小写，防止大小写报错)
+      - name: Image Metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/navidrome-hf
+          # 这里定义了两个标签：
+          # 1. v+运行编号 (例如 v1, v2, v3...)
+          # 2. latest (始终指向最新版，方便 HF 拉取)
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v${{ github.run_number }}
+
+      # 3. 构建并推送
       - name: Build and push
         uses: docker/build-push-action@v4
         with:
           context: .
           push: true
-          # 注意：镜像名会自动转为小写
-          tags: ghcr.io/${{ github.repository_owner }}/navidrome-hf:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
