@@ -1,97 +1,61 @@
 #!/usr/bin/env python3
-# Obfuscated: State Persistence Manager
+# Obfuscated: State Manager
 from huggingface_hub import HfApi
-import sys
-import os
-import time
+import sys, os, tempfile, tarfile
 from datetime import datetime
-import tempfile
-import tarfile
 
-def sys_log(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [STATE_MGR] {msg}")
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [BACKUP] {msg}")
 
-def cleanup_old_snapshots(api, repo_id, retention=5):
+def upload(token, repo, data_dir):
     try:
-        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-        snapshots = [f for f in files if f.startswith('sys_snapshot_') and f.endswith('.tar.gz')]
-        snapshots.sort()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"backup_{timestamp}.tar.gz"
+        tmp = os.path.join(tempfile.gettempdir(), fname)
         
-        if len(snapshots) >= retention:
-            to_remove = snapshots[:(len(snapshots) - retention + 1)]
-            for item in to_remove:
-                api.delete_file(path_in_repo=item, repo_id=repo_id, repo_type="dataset")
-                sys_log(f"Pruned old snapshot: {item}")
-    except Exception as e:
-        sys_log(f"Retention policy error: {str(e)}")
-
-def push_state(data_dir, token, repo_id):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"sys_snapshot_{timestamp}.tar.gz"
-    tmp_path = os.path.join(tempfile.gettempdir(), filename)
-    
-    try:
-        with tarfile.open(tmp_path, "w:gz") as tar:
-            for item in os.listdir(data_dir):
-                full_path = os.path.join(data_dir, item)
-                # 排除大文件缓存，只备份数据库和配置
-                if "cache" in item.lower():
-                    continue
-                tar.add(full_path, arcname=item)
+        with tarfile.open(tmp, "w:gz") as tar:
+            for f in os.listdir(data_dir):
+                if "cache" not in f.lower(): # 排除缓存
+                    tar.add(os.path.join(data_dir, f), arcname=f)
         
         api = HfApi(token=token)
-        api.upload_file(
-            path_or_fileobj=tmp_path,
-            path_in_repo=filename,
-            repo_id=repo_id,
-            repo_type="dataset"
-        )
-        sys_log(f"State captured: {filename}")
-        cleanup_old_snapshots(api, repo_id)
+        api.upload_file(path_or_fileobj=tmp, path_in_repo=fname, repo_id=repo, repo_type="dataset")
+        log(f"Uploaded {fname}")
         
+        # 简单清理旧备份(保留最近5个)
+        files = api.list_repo_files(repo_id=repo, repo_type="dataset")
+        backups = sorted([f for f in files if f.startswith("backup_")])
+        if len(backups) > 5:
+            for old in backups[:-5]:
+                api.delete_file(old, repo, repo_type="dataset")
+                
+        os.remove(tmp)
     except Exception as e:
-        sys_log(f"State capture failed: {str(e)}")
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        log(f"Upload failed: {e}")
 
-def pull_state(data_dir, token, repo_id):
+def download(token, repo, data_dir):
     try:
         os.makedirs(data_dir, exist_ok=True)
         api = HfApi(token=token)
-        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-        snapshots = [f for f in files if f.startswith('sys_snapshot_') and f.endswith('.tar.gz')]
-        
-        if not snapshots:
-            sys_log("No existing state found. Initializing fresh.")
-            return
+        files = api.list_repo_files(repo_id=repo, repo_type="dataset")
+        backups = sorted([f for f in files if f.startswith("backup_")])
+        if not backups: return
 
-        latest = sorted(snapshots)[-1]
-        sys_log(f"Restoring state from: {latest}")
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            local_path = api.hf_hub_download(
-                repo_id=repo_id,
-                filename=latest,
-                repo_type="dataset",
-                local_dir=temp_dir
-            )
-            with tarfile.open(local_path, "r:gz") as tar:
-                tar.extractall(path=data_dir)
-        sys_log("State restoration complete.")
+        latest = backups[-1]
+        log(f"Restoring {latest}...")
+        with tempfile.TemporaryDirectory() as td:
+            path = api.hf_hub_download(repo, latest, repo_type="dataset", local_dir=td)
+            with tarfile.open(path, "r:gz") as tar:
+                tar.extractall(data_dir)
+        log("Restore complete")
     except Exception as e:
-        sys_log(f"State restore failed: {str(e)}")
+        log(f"Restore failed: {e}")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 5:
-        sys.exit(1)
-
-    mode = sys.argv[1] # upload / download
+    action = sys.argv[1] # upload/download
     token = sys.argv[2]
-    repo_id = sys.argv[3]
-    data_dir = sys.argv[4]
-
-    if mode == "upload":
-        push_state(data_dir, token, repo_id)
-    elif mode == "download":
-        pull_state(data_dir, token, repo_id)
+    repo = sys.argv[3]
+    path = sys.argv[4]
+    
+    if action == "upload": upload(token, repo, path)
+    elif action == "download": download(token, repo, path)
