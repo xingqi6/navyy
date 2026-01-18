@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-# Obfuscated: Core Processor (Debug Version)
+# Obfuscated: Intelligent Deduplication Stream Processor
 from huggingface_hub import HfApi, hf_hub_download
 import os
 import sys
 import time
 import json
-import fnmatch
+import re
 import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
 
 # === 配置区域 ===
 DISK_SAFE_LIMIT_MB = 1024  # 1GB 保护
+# 定义音质等级，越靠前品质越高
+QUALITY_HIERARCHY = ['flac24bit', '24bit', 'flac', 'wav', '320', '320k', '192', '128']
 # =================
 
 def log(msg):
@@ -23,69 +26,115 @@ def get_free_space_mb(folder):
         return free // (1024 * 1024)
     except: return 999999
 
-def match_rule(filename, patterns):
-    """智能匹配逻辑"""
-    if not patterns or patterns == "*" or patterns.strip() == "":
-        return True
-    
-    # 统一转小写进行匹配，忽略大小写差异
-    filename_lower = filename.lower()
-    rules = [p.strip().lower() for p in patterns.split(',') if p.strip()]
-    
-    for rule in rules:
-        if "*" in rule:
-            # 通配符模式 (例如: *周杰伦*)
-            if fnmatch.fnmatch(filename_lower, rule):
-                return True
-        else:
-            # 纯文本包含模式 (例如: [320])
-            if rule in filename_lower:
-                return True
-    return False
+def clean_filename(filename):
+    """
+    清洗文件名，用于判断是否为同一首歌。
+    去除 [320], [flac], (Live), 后缀名等，只保留 '歌手/专辑/歌名'
+    """
+    # 去除扩展名
+    base, _ = os.path.splitext(filename)
+    # 去除方括号内容 [320], [flac] 等
+    base = re.sub(r'\[.*?\]', '', base)
+    # 去除圆括号内容 (Live), (Cover) 等 (可选，视情况而定，这里偏保守，只去空格)
+    # base = re.sub(r'\(.*?\)', '', base) 
+    # 去除多余空格
+    base = base.strip()
+    return base.lower()
 
-def get_filtered_files(api, repo_id, artist_patterns, quality_patterns):
+def get_quality_score(filename, target_pattern):
+    """
+    计算文件优先级分数。分数越小，优先级越高。
+    0: 完美匹配用户要求
+    1: 比用户要求更好
+    2: 比用户要求更差
+    3: 未知/其他
+    """
+    fname = filename.lower()
+    target = target_pattern.lower().replace("[", "").replace("]", "").strip() # 去除用户输入的括号
+    
+    # 1. 完美匹配 (包含用户指定的字符)
+    if target != "*" and target in fname:
+        return 0
+    
+    # 提取文件中的音质标识
+    file_q_index = 999
+    target_q_index = 999
+    
+    # 找到文件当前的音质等级
+    for idx, q in enumerate(QUALITY_HIERARCHY):
+        if q in fname:
+            file_q_index = idx
+            break
+            
+    # 找到用户目标的音质等级
+    for idx, q in enumerate(QUALITY_HIERARCHY):
+        if q in target:
+            target_q_index = idx
+            break
+            
+    # 如果没找到用户的目标等级，默认把所有文件都当做“其他”
+    if target_q_index == 999:
+        return 3
+
+    # 2. 比较音质
+    if file_q_index < target_q_index:
+        return 1 # 品质更好 (Index越小品质越高)
+    else:
+        return 2 # 品质更差
+
+def get_smart_file_list(api, repo_id, artist_filter, quality_filter):
+    """
+    获取文件列表，并执行去重和优选逻辑
+    """
     try:
-        log(f"正在获取 {repo_id} 的文件列表...")
+        log(f"正在获取文件列表并计算最优版本...")
         all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
         
-        # --- 🔍 调试核心：打印前 5 个文件看看长什么样 ---
-        log("---------------- 调试信息：Dataset 文件名采样 ----------------")
-        for i, sample in enumerate(all_files[:5]):
-            log(f"样本 {i+1}: {sample}")
-        log("-----------------------------------------------------------")
-        # --------------------------------------------------------
-
-        target_files = []
-        rejected_sample = 0
+        # 1. 歌手/路径初筛
+        candidates = []
+        artist_rules = [p.strip().lower() for p in artist_filter.split(',') if p.strip()]
         
         for f in all_files:
-            # 排除非媒体文件
-            if f.endswith(('.gitattributes', 'README.md', '.git', '.json')):
-                continue
+            if f.endswith(('.gitattributes', 'README.md', '.git', '.json', '.sync_meta')): continue
+            
+            # 歌手过滤
+            if artist_filter != "*":
+                f_lower = f.lower()
+                # 简单包含逻辑，支持通配符
+                if not any((rule.replace("*", "") in f_lower) for rule in artist_rules):
+                    continue
+            candidates.append(f)
 
-            # 1. 歌手匹配
-            if not match_rule(f, artist_patterns):
-                continue
+        # 2. 分组去重
+        song_groups = defaultdict(list)
+        for f in candidates:
+            # 使用清洗后的文件名作为 Key (Key相同视为同一首歌)
+            key = clean_filename(f)
+            song_groups[key].append(f)
             
-            # 2. 音质匹配
-            if not match_rule(f, quality_patterns):
-                # 打印前 3 个因为音质被过滤掉的文件，方便排查
-                if rejected_sample < 3:
-                    log(f"[调试] 文件 '{f}' 通过了歌手过滤，但被音质规则 '{quality_patterns}' 过滤掉了。")
-                    rejected_sample += 1
-                continue
-            
-            target_files.append(f)
-        
-        log(f"过滤统计: 总文件 {len(all_files)} -> 目标文件 {len(target_files)}")
-        return target_files
+        # 3. 组内优选
+        final_list = []
+        for key, group_files in song_groups.items():
+            if len(group_files) == 1:
+                final_list.append(group_files[0]) # 只有这一个，直接下
+            else:
+                # 多个版本，开始PK
+                # 按分数排序：分数越小越好 (匹配 > 高品质 > 低品质)
+                sorted_files = sorted(group_files, key=lambda x: get_quality_score(x, quality_filter))
+                winner = sorted_files[0]
+                final_list.append(winner)
+                # 调试日志：显示选择结果
+                # log(f"歌曲 [{key}] 选择了: {os.path.basename(winner)}")
+
+        log(f"智能筛选: 原始 {len(all_files)} -> 歌手匹配 {len(candidates)} -> 最终去重后 {len(final_list)} 首")
+        return final_list
+
     except Exception as e:
-        log(f"列表获取失败: {e}")
+        log(f"智能列表计算失败: {e}")
         return []
 
 def download_single_file(repo_id, filename, token, target_root):
-    free_mb = get_free_space_mb(target_root)
-    if free_mb < DISK_SAFE_LIMIT_MB: return "DISK_FULL"
+    if get_free_space_mb(target_root) < DISK_SAFE_LIMIT_MB: return "DISK_FULL"
     try:
         hf_hub_download(
             repo_id=repo_id,
@@ -111,31 +160,33 @@ def sync_repo(repo_id, token, root_dir, force=False, artist_filter="*", quality_
         return
 
     api = HfApi(token=token)
-    files_to_download = get_filtered_files(api, repo_id, artist_filter, quality_filter)
+    
+    # 使用新的智能获取函数
+    files_to_download = get_smart_file_list(api, repo_id, artist_filter, quality_filter)
     
     if not files_to_download:
-        log("⚠️ 没有匹配的文件。请检查上方日志中的【文件名采样】和【过滤规则】是否一致。")
+        log("⚠️ 没有符合条件的文件。")
         return
 
-    log(f"准备下载 {len(files_to_download)} 个文件...")
+    log(f"准备下载 {len(files_to_download)} 个最优文件...")
     
     success_count = 0
-    disk_full_flag = False
+    disk_full = False
     
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(download_single_file, repo_id, f, token, target_dir): f for f in files_to_download}
         total = len(files_to_download)
         for i, future in enumerate(as_completed(futures)):
-            res = future.result()
-            if res == "SUCCESS": success_count += 1
-            elif res == "DISK_FULL": 
-                disk_full_flag = True
-                pass
-            if i % 50 == 0: print(f"进度: {i}/{total}...", end="\r", flush=True)
+            if future.result() == "SUCCESS": success_count += 1
+            elif future.result() == "DISK_FULL": 
+                disk_full = True
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            if i % 20 == 0: print(f"进度: {i}/{total}...", end="\r", flush=True)
                 
     print(f"\n") 
     log(f"任务结束。成功: {success_count}/{len(files_to_download)}")
-    if disk_full_flag: log("🛑 触发磁盘保护，部分下载已暂停。")
+    if disk_full: log("🛑 触发磁盘熔断，已停止。")
 
 if __name__ == "__main__":
     if len(sys.argv) < 4: sys.exit(0)
@@ -145,12 +196,12 @@ if __name__ == "__main__":
     artist_filter = sys.argv[6] if len(sys.argv) > 6 else "*"
     quality_filter = sys.argv[7] if len(sys.argv) > 7 else "*"
 
-    print(f"[DEBUG] 启动模式: 歌手='{artist_filter}', 音质='{quality_filter}'", flush=True)
+    print(f"[DEBUG] 智能模式启动: 优选品质='{quality_filter}'", flush=True)
 
     for s in sources: 
         sync_repo(s, token, root, force=True, artist_filter=artist_filter, quality_filter=quality_filter)
 
-    log("进入监控模式...")
+    log("监控模式已启动...")
     while True:
         time.sleep(interval)
         for s in sources: 
